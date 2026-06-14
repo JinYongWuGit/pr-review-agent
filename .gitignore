@@ -1,0 +1,12 @@
+.venv/
+.env
+changes.txt
+output.md
+review_threads.json
+error.txt
+pr-thread.json
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cursor_pr_review_for_branch_*.md
+/.vs

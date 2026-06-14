@@ -1,0 +1,292 @@
+# Reusable PR review job: diff in PR repo (self) + Python scripts from AGENT_DIR/scripts (or legacy flat layout).
+# Consumers: extends this template; pass agentRepository empty for scripts in same repo as PR.
+# On-demand: pass prUrl to review any PR in the project (clone target repo with this agent package).
+parameters:
+  - name: agentRepository
+    type: string
+    default: ""
+  - name: prUrl
+    type: string
+    default: ""
+
+# pr-review-agent-vars variable group (AZURE_SERVICE_CONNECTION, PROJECT_ENDPOINT, etc.) must be declared on the
+# consumer wrapper (extends root), not here -- job-scoped groups do not resolve for AzureCLI azureSubscription.
+jobs:
+  - job: FoundryPrReview
+    displayName: Foundry PR review
+    variables:
+      - name: pythonVersion
+        value: "3.11"
+      - name: prReviewTargetBranch
+        value: develop
+      - name: ReviewRepoRoot
+        value: $(Build.Repository.LocalPath)
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+      # path: s keeps the PR repo at $(Build.Repository.LocalPath); without it, multi-checkout
+      # puts self under s/<repo-name> and git diff fails (no .git at SourcesDirectory).
+      - checkout: self
+        fetchDepth: 0
+        persistCredentials: true
+        path: s
+
+      - ${{ if ne(parameters.agentRepository, '') }}:
+        - checkout: ${{ parameters.agentRepository }}
+          path: pr-review-agent
+
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: "$(pythonVersion)"
+
+      - ${{ if ne(parameters.prUrl, '') }}:
+        - bash: |
+            set -euo pipefail
+            REPO_ROOT="$(Build.Repository.LocalPath)"
+            if [ -f "${REPO_ROOT}/pr-review/requirements.txt" ]; then
+              AGENT_DIR="${REPO_ROOT}/pr-review"
+            else
+              AGENT_DIR="${REPO_ROOT}"
+            fi
+            if [ -d "${AGENT_DIR}/scripts" ]; then
+              SCRIPTS_DIR="${AGENT_DIR}/scripts"
+            else
+              SCRIPTS_DIR="${AGENT_DIR}"
+            fi
+            CONTEXT="$(Agent.BuildDirectory)/pr-review-context.env"
+            TARGET="$(Agent.BuildDirectory)/pr-review-target"
+
+            python "$SCRIPTS_DIR/resolve_pr_from_url.py" "${PR_REVIEW_PR_URL}" > "$CONTEXT"
+            # shellcheck source=/dev/null
+            set -a
+            source "$CONTEXT"
+            set +a
+
+            echo "Resolved PR #${ADO_PR_ID} (${ADO_REPO_NAME}) -> ${TARGET}"
+            rm -rf "$TARGET"
+            if [ -z "${REPO_REMOTE_URL:-}" ]; then
+              echo "REPO_REMOTE_URL is empty after resolve." >&2
+              exit 1
+            fi
+
+            # JWT in -c http.extraheader=... breaks git parsing; use oauth2@ URL + config.
+            AUTH_REMOTE="https://oauth2:${SYSTEM_ACCESSTOKEN}@${REPO_REMOTE_URL#https://}"
+            git clone "${AUTH_REMOTE}" "$TARGET"
+            cd "$TARGET"
+            git config http.extraHeader "AUTHORIZATION: bearer ${SYSTEM_ACCESSTOKEN}"
+
+            if [ -n "${PR_SOURCE_REF:-}" ]; then
+              git fetch origin "${PR_SOURCE_REF}"
+              git checkout FETCH_HEAD
+            elif [ -n "${PR_SOURCE_COMMIT:-}" ]; then
+              git fetch origin "${PR_SOURCE_COMMIT}"
+              git checkout "${PR_SOURCE_COMMIT}"
+            else
+              echo "No PR source ref or commit." >&2
+              exit 1
+            fi
+
+            if ! git fetch origin "refs/heads/${PR_TARGET_BRANCH}:refs/remotes/origin/${PR_TARGET_BRANCH}"; then
+              git fetch origin "${PR_TARGET_BRANCH}"
+            fi
+
+            echo "##vso[task.setvariable variable=ReviewRepoRoot]${TARGET}"
+          displayName: Resolve PR URL and clone target repository
+          env:
+            SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            PR_REVIEW_PR_URL: ${{ parameters.prUrl }}
+
+      - task: AzureCLI@2
+        displayName: Diff, review, post PR comment
+        inputs:
+          azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+          scriptType: bash
+          scriptLocation: inlineScript
+          addSpnToEnvironment: true
+          inlineScript: |
+            set -euo pipefail
+            ON_DEMAND=0
+            if [ -n "${PR_REVIEW_PR_URL:-}" ]; then
+              ON_DEMAND=1
+              ROOT="$(Agent.BuildDirectory)/pr-review-target"
+              REPO_ROOT="$(Build.Repository.LocalPath)"
+              if [ -f "${REPO_ROOT}/pr-review/requirements.txt" ]; then
+                AGENT_DIR="${REPO_ROOT}/pr-review"
+              else
+                AGENT_DIR="${REPO_ROOT}"
+              fi
+              CONTEXT="$(Agent.BuildDirectory)/pr-review-context.env"
+              if [ -f "$CONTEXT" ]; then
+                set -a
+                # shellcheck source=/dev/null
+                source "$CONTEXT"
+                set +a
+              fi
+            elif [ -n "${PR_REVIEW_AGENT_REPO:-}" ]; then
+              ROOT="$(Build.Repository.LocalPath)"
+              AGENT_CHECKOUT="$(Agent.BuildDirectory)/pr-review-agent"
+              if [ -f "${AGENT_CHECKOUT}/pr-review/requirements.txt" ]; then
+                AGENT_DIR="${AGENT_CHECKOUT}/pr-review"
+              else
+                AGENT_DIR="${AGENT_CHECKOUT}"
+              fi
+            else
+              ROOT="$(Build.Repository.LocalPath)"
+              if [ -f "${ROOT}/pr-review/requirements.txt" ]; then
+                AGENT_DIR="${ROOT}/pr-review"
+              else
+                AGENT_DIR="${ROOT}"
+              fi
+            fi
+            if [ -d "${AGENT_DIR}/scripts" ]; then
+              SCRIPTS_DIR="${AGENT_DIR}/scripts"
+            else
+              SCRIPTS_DIR="${AGENT_DIR}"
+            fi
+            cd "$ROOT"
+
+            IS_PR=0
+            if [ "$ON_DEMAND" -eq 1 ]; then
+              IS_PR=1
+              TB="refs/heads/${PR_TARGET_BRANCH:-develop}"
+              echo "On-demand PR #${ADO_PR_ID} (${ADO_REPO_NAME:-}) target: ${TB}"
+            elif [ -n "${SYSTEM_PULLREQUEST_PULLREQUESTID:-}" ]; then
+              IS_PR=1
+              TB="${SYSTEM_PULLREQUEST_TARGETBRANCH:-refs/heads/develop}"
+              echo "PR #${SYSTEM_PULLREQUEST_PULLREQUESTID} target branch: ${TB}"
+            else
+              TB="refs/heads/${PR_REVIEW_TARGET_BRANCH:-develop}"
+              echo "Branch build (no PR); diff vs ${TB}"
+            fi
+            TB="${TB#refs/heads/}"
+            TARGET_REF="origin/${TB}"
+            echo "Diff target: ${TARGET_REF}...HEAD"
+            echo "ROOT (PR repo)=${ROOT}"
+            echo "AGENT_DIR (package)=${AGENT_DIR}"
+            echo "SCRIPTS_DIR=${SCRIPTS_DIR}"
+
+            if ! git fetch origin "refs/heads/${TB}:refs/remotes/origin/${TB}"; then
+              if ! git fetch origin "${TB}"; then
+                echo "Could not fetch ${TB}; ensure ref exists." >&2
+                exit 1
+              fi
+            fi
+
+            REVIEW_SHA="$(git rev-parse HEAD)"
+            echo "Review commit (git rev-parse HEAD): ${REVIEW_SHA}"
+            export BUILD_SOURCEVERSION="${REVIEW_SHA}"
+            export PR_REPO_ROOT="${ROOT}"
+
+            python -m pip install --upgrade pip
+            pip install -r "$AGENT_DIR/requirements.txt"
+
+            export PROJECT_ENDPOINT="$(PROJECT_ENDPOINT)"
+            export PR_RVW_AGENT_NAME="$(PR_RVW_AGENT_NAME)"
+            export PR_RVW_MODEL_DEPLOYMENT_NAME="$(PR_RVW_MODEL_DEPLOYMENT_NAME)"
+            export PR_REVIEW_INLINE_JSON=1
+            export ADO_ACCESS_TOKEN="${SYSTEM_ACCESSTOKEN}"
+            export PR_REVIEW_PR_TITLE="${SYSTEM_PULLREQUEST_TITLE:-${PR_TITLE:-}}"
+
+            cd "$SCRIPTS_DIR"
+            if [ "$IS_PR" -eq 1 ]; then
+              if [ "$ON_DEMAND" -ne 1 ]; then
+                export ADO_THREADS_URL="$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.ID)/pullRequests/$(System.PullRequest.PullRequestId)/threads?api-version=7.1"
+              fi
+              if [ "$(python pr_review_state.py should-skip)" = "yes" ]; then
+                echo "Skipping review: commit already has a pr-review-agent marker on this PR."
+                exit 0
+              fi
+            else
+              echo "Skipping dedup and ADO post (not a PR build)."
+            fi
+
+            cd "$ROOT"
+            DIFF_MODE="full PR (${TARGET_REF}...HEAD)"
+            if [ "$IS_PR" -eq 1 ]; then
+              LAST_REVIEWED="$(cd "$SCRIPTS_DIR" && python pr_review_state.py latest-reviewed-sha 2>/dev/null || true)"
+              if [ -n "${LAST_REVIEWED}" ] && git merge-base --is-ancestor "${LAST_REVIEWED}" HEAD 2>/dev/null; then
+                git diff "${LAST_REVIEWED}..HEAD" > "$ROOT/changes.txt"
+                DIFF_MODE="incremental (${LAST_REVIEWED}..HEAD)"
+              else
+                git diff "${TARGET_REF}"...HEAD > "$ROOT/changes.txt"
+              fi
+            else
+              git diff "${TARGET_REF}"...HEAD > "$ROOT/changes.txt"
+            fi
+            echo "Diff mode: ${DIFF_MODE}"
+
+            if [ ! -s "$ROOT/changes.txt" ]; then
+              echo "Empty diff; writing placeholder review."
+            fi
+
+            cd "$SCRIPTS_DIR"
+
+            FOUNDRY_PROJECT="${PROJECT_ENDPOINT#*/projects/}"
+            FOUNDRY_PROJECT="${FOUNDRY_PROJECT%%/*}"
+            FOUNDRY_PROJECT="${FOUNDRY_PROJECT%%\?*}"
+            echo "PR_RVW_AGENT_NAME=${PR_RVW_AGENT_NAME:-<unset>}"
+            echo "PR_RVW_MODEL_DEPLOYMENT_NAME=${PR_RVW_MODEL_DEPLOYMENT_NAME:-<unset>}"
+            echo "Foundry project (from PROJECT_ENDPOINT): ${FOUNDRY_PROJECT:-<could not parse>}"
+            echo "PROJECT_ENDPOINT=${PROJECT_ENDPOINT:-<unset>}"
+
+            python review_from_diff.py "$ROOT/changes.txt" "$ROOT/output.md"
+
+            if [ "$IS_PR" -eq 1 ]; then
+              if [ -f "$ROOT/review_threads.json" ] && [ -s "$ROOT/review_threads.json" ]; then
+                python post_pr_review.py "$ROOT/review_threads.json"
+              else
+                python pr_review_state.py stamp-summary "$ROOT/output.md"
+                jq -n --rawfile c "$ROOT/output.md" \
+                  '{comments: [{parentCommentId: 0, content: $c, commentType: 1}], status: 2}' \
+                  > "$ROOT/pr-thread.json"
+
+                curl --fail-with-body --silent --show-error \
+                  --request POST "${ADO_THREADS_URL}" \
+                  --header "Content-Type: application/json" \
+                  --header "Accept: application/json" \
+                  --header "Authorization: Bearer ${SYSTEM_ACCESSTOKEN}" \
+                  --data @"$ROOT/pr-thread.json"
+              fi
+            else
+              echo "Review written to output.md; not posting to ADO (branch build)."
+            fi
+        env:
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+          SYSTEM_PULLREQUEST_PULLREQUESTID: $(System.PullRequest.PullRequestId)
+          SYSTEM_PULLREQUEST_TARGETBRANCH: $(System.PullRequest.TargetBranch)
+          SYSTEM_PULLREQUEST_TITLE: $(System.PullRequest.Title)
+          PROJECT_ENDPOINT: $(PROJECT_ENDPOINT)
+          PR_RVW_AGENT_NAME: $(PR_RVW_AGENT_NAME)
+          PR_RVW_MODEL_DEPLOYMENT_NAME: $(PR_RVW_MODEL_DEPLOYMENT_NAME)
+          PR_REVIEW_TARGET_BRANCH: $(prReviewTargetBranch)
+          PR_REVIEW_AGENT_REPO: ${{ parameters.agentRepository }}
+          PR_REVIEW_PR_URL: ${{ parameters.prUrl }}
+
+      - bash: |
+          ROOT="$(ReviewRepoRoot)"
+          if [ -f "$ROOT/changes.txt" ]; then
+            echo "##vso[task.setvariable variable=PublishReviewChanges]true"
+          else
+            echo "changes.txt not found; skip artifact publish"
+          fi
+          if [ -f "$ROOT/output.md" ]; then
+            echo "##vso[task.setvariable variable=PublishReviewOutput]true"
+          else
+            echo "output.md not found; skip artifact publish"
+          fi
+        displayName: Check review artifacts exist
+        condition: succeeded()
+
+      - task: PublishPipelineArtifact@1
+        displayName: Publish PR diff (changes.txt)
+        condition: and(succeeded(), eq(variables['PublishReviewChanges'], 'true'))
+        inputs:
+          targetPath: "$(ReviewRepoRoot)/changes.txt"
+          artifactName: pr-review-changes
+
+      - task: PublishPipelineArtifact@1
+        displayName: Publish review markdown (output.md)
+        condition: and(succeeded(), eq(variables['PublishReviewOutput'], 'true'))
+        inputs:
+          targetPath: "$(ReviewRepoRoot)/output.md"
+          artifactName: pr-review-output

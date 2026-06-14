@@ -1,0 +1,25 @@
+# Manual PR review: paste an Azure DevOps PR URL; reviews and posts threads on that PR.
+#
+# Azure DevOps setup (once):
+# - New pipeline -> this repo -> Existing YAML -> this file.
+# - Variable group pr-review-agent-vars (AZURE_SERVICE_CONNECTION, PROJECT_ENDPOINT, PR_RVW_AGENT_NAME, PR_RVW_MODEL_DEPLOYMENT_NAME).
+# - Enable "Allow scripts to access the OAuth token".
+# - Grant this pipeline's build identity "Contribute to pull requests" on each target repo you review.
+
+trigger: none
+
+pr: none
+
+parameters:
+  - name: prUrl
+    displayName: Azure DevOps PR URL
+    type: string
+
+variables:
+  - group: pr-review-agent-vars
+
+extends:
+  template: pr-review-gated.yml
+  parameters:
+    agentRepository: ""
+    prUrl: ${{ parameters.prUrl }}
